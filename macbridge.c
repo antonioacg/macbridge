@@ -46,6 +46,7 @@
 #define ARP_OP_REPLY 2
 #define MAX_ARP_CACHE 64
 #define ETH_BRIDGE_IP "169.254.0.1"  /* link-local, avoids subnet conflicts */
+#define DNSMASQ_LOG   "/tmp/macbridge-dnsmasq.log"
 
 struct arp_packet {
     struct ether_header eth;
@@ -71,6 +72,7 @@ static volatile int running = 1;
 
 /* Cleanup state — set by bridge, used by watchdog */
 static pid_t dnsmasq_pid = 0;
+static pid_t forwarder_pid = 0;
 static pid_t bridge_pid = 0;
 static char cleanup_remote_ip[32] = {0};
 static int check_interface_was = -1;
@@ -88,6 +90,13 @@ static void do_cleanup(void) {
         waitpid(dnsmasq_pid, NULL, 0);
         dnsmasq_pid = 0;
         fprintf(stderr, "macbridge: dnsmasq stopped\n");
+    }
+    if (forwarder_pid > 0) {
+        /* Forwarder normally exits on its own when the dnsmasq pipe
+           closes (EOF). Send SIGTERM as a fallback in case it's wedged. */
+        kill(forwarder_pid, SIGTERM);
+        waitpid(forwarder_pid, NULL, 0);
+        forwarder_pid = 0;
     }
 
     if (check_interface_was >= 0) {
@@ -434,6 +443,58 @@ static void send_arp_reply(int bpf_fd, const uint8_t *my_mac,
     write(bpf_fd, &reply, sizeof(reply));
 }
 
+/*
+ * Forwarder child: reads dnsmasq's stdout/stderr from a pipe, writes every
+ * line to the on-disk log, and surfaces "important" events (lease grants,
+ * errors) on the main stderr — with a leading \r\033[K so it overwrites any
+ * in-place heartbeat line instead of colliding with it.
+ */
+static pid_t start_dnsmasq_forwarder(int readfd) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork forwarder");
+        return -1;
+    }
+    if (pid == 0) {
+        /* Child: detach from parent's signal handlers; normal EOF exit. */
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGPIPE, SIG_IGN);
+
+        FILE *fp = fdopen(readfd, "r");
+        FILE *logf = fopen(DNSMASQ_LOG, "a");
+        if (!fp) _exit(1);
+
+        const int is_tty = isatty(STDERR_FILENO);
+        const char *prefix = is_tty ? "\r\033[K" : "";
+
+        char buf[1024];
+        while (fgets(buf, sizeof(buf), fp)) {
+            if (logf) { fputs(buf, logf); fflush(logf); }
+
+            /* Surface only actionable events so we don't spam the main
+               pane. DHCPACK confirms the remote got its lease; the rest
+               are failure modes worth interrupting the heartbeat for. */
+            if (strstr(buf, "DHCPACK")  ||
+                strstr(buf, "failed")   ||
+                strstr(buf, "error")    ||
+                strstr(buf, "cannot")   ||
+                strstr(buf, "bad ")     ||
+                strstr(buf, "refused")) {
+                fprintf(stderr, "%smacbridge: dnsmasq: %s", prefix, buf);
+                fflush(stderr);
+            }
+        }
+        if (logf) fclose(logf);
+        _exit(0);
+    }
+    /* Parent closes the read end — forwarder owns it now. */
+    close(readfd);
+    return pid;
+}
+
 /* Configure eth interface and start dnsmasq as child process */
 static pid_t start_dhcp(const char *eth_if, const char *remote_ip,
                         uint32_t gw_ip) {
@@ -456,14 +517,23 @@ static pid_t start_dhcp(const char *eth_if, const char *remote_ip,
     system(cmd);
     fprintf(stderr, "macbridge: %s configured as %s\n", eth_if, eth_ip);
 
+    /* Pipe for dnsmasq's stdout/stderr → forwarder child */
+    int pipefd[2];
+    if (pipe(pipefd) < 0) {
+        perror("pipe");
+        return -1;
+    }
+
     /* Fork dnsmasq */
     pid_t pid = fork();
     if (pid < 0) {
         perror("fork");
+        close(pipefd[0]);
+        close(pipefd[1]);
         return -1;
     }
     if (pid == 0) {
-        /* Child: exec dnsmasq */
+        /* Child: exec dnsmasq, writing to the pipe */
         char range[128], opt_gw[64], opt_dns[64];
         snprintf(range, sizeof(range),
                  "--dhcp-range=%s,%s,255.255.255.0,12h", remote_ip, remote_ip);
@@ -472,6 +542,11 @@ static pid_t start_dhcp(const char *eth_if, const char *remote_ip,
 
         char iface_opt[64];
         snprintf(iface_opt, sizeof(iface_opt), "--interface=%s", eth_if);
+
+        close(pipefd[0]);                  /* no read end in dnsmasq */
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        if (pipefd[1] > STDERR_FILENO) close(pipefd[1]);
 
         execlp("dnsmasq", "dnsmasq",
                iface_opt, "--bind-interfaces",
@@ -483,7 +558,12 @@ static pid_t start_dhcp(const char *eth_if, const char *remote_ip,
         _exit(1);
     }
 
-    fprintf(stderr, "macbridge: dnsmasq started (pid %d)\n", pid);
+    /* Parent closes the write end; spawn forwarder to consume the read end. */
+    close(pipefd[1]);
+    forwarder_pid = start_dnsmasq_forwarder(pipefd[0]);
+
+    fprintf(stderr, "macbridge: dnsmasq started (pid %d, log: %s)\n",
+            pid, DNSMASQ_LOG);
 
     /* Wait for dnsmasq to be ready */
     usleep(500000);
@@ -1005,11 +1085,16 @@ int main(int argc, char **argv) {
         }
         iteration++;
 
-        /* (Re)start dnsmasq. Kill any stale one first. */
+        /* (Re)start dnsmasq + forwarder. Kill any stale ones first. */
         if (dnsmasq_pid > 0) {
             kill(dnsmasq_pid, SIGTERM);
             waitpid(dnsmasq_pid, NULL, 0);
             dnsmasq_pid = 0;
+        }
+        if (forwarder_pid > 0) {
+            kill(forwarder_pid, SIGTERM);
+            waitpid(forwarder_pid, NULL, 0);
+            forwarder_pid = 0;
         }
         dnsmasq_pid = start_dhcp(eth_if, remote_ip_str, gw_ip);
         if (dnsmasq_pid < 0) {
@@ -1039,10 +1124,45 @@ int main(int argc, char **argv) {
             _exit(rc);
         }
 
-        /* === PARENT waits for child === */
-        int status;
-        while (waitpid(bridge_pid, &status, 0) < 0 && errno == EINTR) { }
-        bridge_pid = 0;
+        /*
+         * Parent waits on ANY child (bridge, dnsmasq, forwarder). If a
+         * helper dies first we tear down the bridge so the next iteration
+         * of the supervisor loop starts everything fresh.
+         */
+        int status = 0;
+        for (;;) {
+            pid_t dead = waitpid(-1, &status, 0);
+            if (dead < 0) {
+                if (errno == EINTR) continue;
+                break;  /* ECHILD or similar — fall through to respawn */
+            }
+            if (dead == bridge_pid) {
+                bridge_pid = 0;
+                break;
+            }
+            if (dead == dnsmasq_pid) {
+                fprintf(stderr, "\nmacbridge: dnsmasq died unexpectedly "
+                                "— restarting everything\n");
+                dnsmasq_pid = 0;
+                if (bridge_pid > 0) kill(bridge_pid, SIGTERM);
+                continue;  /* keep waiting; bridge will exit next */
+            }
+            if (dead == forwarder_pid) {
+                /* Forwarder normally exits when dnsmasq closes the pipe
+                   during shutdown. If it dies while dnsmasq is still
+                   running, restart the whole stack so the log chain
+                   stays connected. */
+                forwarder_pid = 0;
+                if (dnsmasq_pid > 0) {
+                    fprintf(stderr, "\nmacbridge: dnsmasq log forwarder died "
+                                    "— restarting everything\n");
+                    kill(dnsmasq_pid, SIGTERM);
+                }
+                if (bridge_pid > 0) kill(bridge_pid, SIGTERM);
+                continue;
+            }
+            /* Unknown child — ignore and keep waiting. */
+        }
 
         if (WIFEXITED(status)) {
             last_exit = WEXITSTATUS(status);
