@@ -208,7 +208,86 @@ static int get_sysctl_int(const char *name) {
     return val;
 }
 
-static int open_bpf(const char *ifname, int *buflen, int see_sent) {
+/*
+ * cBPF filter for the Wi-Fi interface.
+ *
+ * Accept:
+ *   - All ARP (ethertype 0x0806) — small volume, lets us proxy
+ *   - IP (0x0800) where dst IP == remote_ip — traffic to the bridged device
+ *
+ * Drop everything else — kernel filters before buffering.
+ *
+ * Instruction layout:
+ *   [0] ldh  [12]                  ; load ethertype
+ *   [1] jeq  0x0806 -> accept      ; if ARP, jump to accept
+ *   [2] jeq  0x0800 -> continue    ; if not IP, drop
+ *   [3] ld   [30]                  ; load IPv4 dst address (offset 14 + 16)
+ *   [4] jeq  remote_ip -> accept   ; else drop
+ *   [5] ret  65535                 ; accept (full frame)
+ *   [6] ret  0                     ; drop
+ */
+static struct bpf_insn wifi_filter_prog[7];
+static struct bpf_program wifi_filter = { 7, wifi_filter_prog };
+
+static void build_wifi_filter(uint32_t remote_ip) {
+    struct bpf_insn p[] = {
+        BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 12),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x0806, 3, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x0800, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 30),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, ntohl(remote_ip), 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, 65535),
+        BPF_STMT(BPF_RET | BPF_K, 0),
+    };
+    memcpy(wifi_filter_prog, p, sizeof(p));
+}
+
+/*
+ * cBPF filter for the Ethernet interface.
+ *
+ * Accept only frames with src MAC == remote_mac.
+ * Kernel drops DHCP discovers, broadcasts from other devices, etc.
+ *
+ *   [0] ld   [6]                   ; first 4 bytes of src MAC
+ *   [1] jeq  mac[0..3] -> continue
+ *   [2] ldh  [10]                  ; last 2 bytes of src MAC
+ *   [3] jeq  mac[4..5] -> accept
+ *   [4] ret  65535
+ *   [5] ret  0
+ */
+static struct bpf_insn eth_filter_prog[6];
+static struct bpf_program eth_filter = { 6, eth_filter_prog };
+
+static void build_eth_filter(const uint8_t *remote_mac) {
+    uint32_t mac_hi = ((uint32_t)remote_mac[0] << 24) |
+                      ((uint32_t)remote_mac[1] << 16) |
+                      ((uint32_t)remote_mac[2] << 8)  |
+                       (uint32_t)remote_mac[3];
+    uint16_t mac_lo = ((uint16_t)remote_mac[4] << 8) | remote_mac[5];
+
+    struct bpf_insn p[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 6),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, mac_hi, 0, 3),
+        BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 10),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, mac_lo, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, 65535),
+        BPF_STMT(BPF_RET | BPF_K, 0),
+    };
+    memcpy(eth_filter_prog, p, sizeof(p));
+}
+
+/*
+ * Open a BPF device and bind it to an interface.
+ *
+ * Buffer sizing: BIOCSBLEN must be called BEFORE BIOCSETIF.
+ * We request 4MB and let the kernel cap it at whatever maximum it allows.
+ *
+ * see_sent: 0 = only incoming frames, 1 = incoming + locally-generated outgoing
+ * filter:   optional cBPF filter program (NULL = accept everything)
+ * immediate: 1 = wake up per-packet (low latency), 0 = batch (high throughput)
+ */
+static int open_bpf(const char *ifname, int *buflen, int see_sent,
+                    struct bpf_program *filter, int immediate) {
     char dev[32];
     int fd = -1;
 
@@ -223,6 +302,13 @@ static int open_bpf(const char *ifname, int *buflen, int see_sent) {
         return -1;
     }
 
+    /* Request large buffer BEFORE BIOCSETIF. Kernel will silently cap it. */
+    int want = 4 * 1024 * 1024; /* 4 MB */
+    while (want >= 32768) {
+        if (ioctl(fd, BIOCSBLEN, &want) == 0) break;
+        want /= 2;
+    }
+
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
     strlcpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
@@ -233,15 +319,25 @@ static int open_bpf(const char *ifname, int *buflen, int see_sent) {
     }
 
     int enable = 1;
-    ioctl(fd, BIOCIMMEDIATE, &enable);
+    if (immediate)
+        ioctl(fd, BIOCIMMEDIATE, &enable);
     ioctl(fd, BIOCSHDRCMPLT, &enable);
     ioctl(fd, BIOCSSEESENT, &see_sent);
+
+    /* Install kernel-side filter — kernel drops non-matching frames
+       before they hit the BPF buffer. Massive throughput win. */
+    if (filter && ioctl(fd, BIOCSETF, filter) < 0) {
+        perror("BIOCSETF");
+        close(fd);
+        return -1;
+    }
 
     if (ioctl(fd, BIOCGBLEN, buflen) < 0) {
         perror("BIOCGBLEN");
         close(fd);
         return -1;
     }
+    fprintf(stderr, "macbridge: %s BPF buffer = %d bytes\n", ifname, *buflen);
 
     return fd;
 }
@@ -386,12 +482,13 @@ static int run_bridge(const char *wifi_if, const char *eth_if,
     get_mac(wifi_if, wifi_mac);
     get_mac(eth_if, eth_mac);
 
-    /* Phase 1: ARP discovery with see_sent=0 */
+    /* Phase 1: ARP discovery with see_sent=0, no filter, immediate mode.
+       We need to see all traffic to catch ARP replies. */
     int wifi_buflen, eth_buflen;
-    int bpf_wifi = open_bpf(wifi_if, &wifi_buflen, 0);
+    int bpf_wifi = open_bpf(wifi_if, &wifi_buflen, 0, NULL, 1);
     if (bpf_wifi < 0) return 1;
 
-    int bpf_eth = open_bpf(eth_if, &eth_buflen, 0);
+    int bpf_eth = open_bpf(eth_if, &eth_buflen, 0, NULL, 1);
     if (bpf_eth < 0) { close(bpf_wifi); return 1; }
 
     fprintf(stderr, "macbridge: waiting for remote %s on %s...\n",
@@ -444,10 +541,21 @@ found_remote:
 
     arp_cache_put(gw_ip, gw_mac);
 
-    /* Phase 2: Reopen Wi-Fi BPF with see_sent=1 */
+    /* Phase 2: Reopen both BPFs for the main loop with:
+         - Kernel-side filters (dramatically reduces kernel->user copies)
+         - Large buffers (absorb bursts)
+         - see_sent=1 on Wi-Fi so we capture the Mac's own outgoing traffic
+       Immediate mode kept ON — low latency matters more than batch efficiency
+       for interactive workloads (SSH, ping). Can be disabled for pure throughput. */
+    build_wifi_filter(remote_ip);
+    build_eth_filter(remote_mac);
+
     close(bpf_wifi);
-    bpf_wifi = open_bpf(wifi_if, &wifi_buflen, 1);
-    if (bpf_wifi < 0) { close(bpf_eth); return 1; }
+    close(bpf_eth);
+    bpf_wifi = open_bpf(wifi_if, &wifi_buflen, 1, &wifi_filter, 1);
+    if (bpf_wifi < 0) return 1;
+    bpf_eth = open_bpf(eth_if, &eth_buflen, 0, &eth_filter, 1);
+    if (bpf_eth < 0) { close(bpf_wifi); return 1; }
 
     /* Enable weak host model */
     system("sysctl -w net.inet.ip.check_interface=0 >/dev/null 2>&1");

@@ -51,6 +51,10 @@ Find your interfaces with `networksetup -listallhardwareports`.
 - **Ethernet → Wi-Fi**: Packets from the remote are rewritten with the Mac's Wi-Fi MAC as source and injected on Wi-Fi, appearing to come from the Mac.
 - **ARP proxy**: macbridge answers ARP requests for the remote IP on Wi-Fi, and answers all ARP requests from the remote on Ethernet (acting as the entire network).
 
+## Performance
+
+Roughly gigabit-class with TCP, limited in practice by your Wi-Fi uplink. Uses kernel-side cBPF filters and 4 MB BPF buffers so the kernel drops irrelevant frames before they reach userspace. See [CLAUDE.md](CLAUDE.md) for measured numbers and design notes.
+
 ## Cleanup guarantee
 
 macbridge uses a watchdog process pattern:

@@ -98,6 +98,43 @@ dnsmasq is fork/exec'd by the watchdog (not the bridge child) so the watchdog ca
 - Only happens if watchdog itself is `kill -9`'d
 - Fix: `sudo pkill dnsmasq; sudo sysctl -w net.inet.ip.check_interface=1; sudo arp -d <ip>`
 
+## Performance
+
+### Measured throughput (Mac ↔ OrangePi 5 Pro over USB Gigabit + Wi-Fi)
+
+| Direction | Throughput | Notes |
+|---|---|---|
+| Remote → Mac | 332 Mbps, 0 retrans | Bridge bypassed (dst = wifi_ip, skip path) |
+| Mac → Remote (TCP) | 63 Mbps, 0 retrans | Wi-Fi uplink is the ceiling |
+| Mac → Remote (UDP) | 60 Mbps, <1% loss | Same ceiling |
+
+Before filter+buffer fixes: 37 Mbps TCP with thousands of retransmits, 87% UDP loss.
+
+### Why Remote → Mac is faster
+That direction doesn't go through the bridge. The OrangePi sends IP packets to the Mac's en0 IP (via gateway eth_mac on en10), the kernel accepts them on en10 directly (weak host model), and the bridge's eth→wifi forwarding logic skips them (`dst_ip == wifi_ip`). So that path is pure kernel networking, not userspace packet rewriting.
+
+### Why Mac → Remote went from 37 → 63 Mbps
+Two fixes, both required:
+
+1. **Kernel-side cBPF filter (`BIOCSETF`)**. Without a filter, BPF copies every frame on the wire into the userspace buffer — including all Wi-Fi chatter from unrelated hosts. Userspace then discards 99% of them. With a filter (`arp || (ip && dst host remote_ip)` on en0, `ether src host remote_mac` on en10), the kernel drops non-matching frames before buffering. Cuts kernel→user copy rate by 10-100x.
+
+2. **4 MB BPF buffer (`BIOCSBLEN` before `BIOCSETIF`)**. Default is 4 KB — overflows instantly under load. Drops happen in-kernel and are invisible to us. Request 4 MB up front, fall back by halving if the kernel rejects. macOS accepted 4 MB without complaint.
+
+### Remaining ceiling
+60-65 Mbps is the Wi-Fi uplink from this Mac to this AP. Confirmed by multi-stream iperf (same aggregate). For higher throughput you'd need a faster Wi-Fi link or ethernet-to-ethernet.
+
+### What's NOT available on macOS for further gains
+- **Zero-copy BPF** (`BIOCSETBUFMODE` + `BPF_BUFMODE_ZBUF`): FreeBSD has it, Darwin doesn't. The kernel→user copy for every packet is mandatory on macOS.
+- **AF_PACKET / PF_PACKET sockets**: Linux-only.
+- **TUN/TAP with kernel bridge**: macOS has utun (L3 only, no L2). No native TAP without a kext.
+
+The ceiling for a pure-userspace BPF bridge on macOS is roughly 1-2 Gbps on modern hardware with these optimizations. Beyond that requires a system extension (Network Extension framework) or kext.
+
+### If you want more throughput
+- Disable `BIOCIMMEDIATE` (set to 0) — kernel batches packets, trading latency for throughput. Good for bulk transfers, bad for ping/SSH.
+- Multiple BPF reader threads with `pthread` — one per interface instead of shared `poll()`.
+- Preallocate packet buffers, avoid any allocation in the hot path (already done).
+
 ## Build
 
 ```bash
