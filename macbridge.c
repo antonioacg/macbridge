@@ -74,6 +74,7 @@ static pid_t dnsmasq_pid = 0;
 static pid_t bridge_pid = 0;
 static char cleanup_remote_ip[32] = {0};
 static int check_interface_was = -1;
+static volatile int user_quit = 0;
 
 /*
  * Cleanup runs in the WATCHDOG process (parent), never in signal
@@ -109,8 +110,10 @@ static void do_cleanup(void) {
     }
 }
 
-/* Watchdog signal handler: forward to bridge child, then wait */
+/* Watchdog signal handler: user wants to quit. Forward to bridge child and
+   set the flag so the retry loop stops looping. */
 static void watchdog_signal(int sig) {
+    user_quit = 1;
     if (bridge_pid > 0)
         kill(bridge_pid, sig);
     /* Don't exit — let the main waitpid() loop collect the child */
@@ -120,6 +123,16 @@ static void watchdog_signal(int sig) {
 static void handle_signal(int sig) {
     (void)sig;
     running = 0;
+}
+
+/* Fatal signal handler: best-effort cleanup then re-raise.
+   Technically async-signal-unsafe (do_cleanup calls system()), but we're
+   already crashing — the alternative is no cleanup at all, leaving
+   check_interface=0 and a dangling static ARP entry. */
+static void handle_fatal(int sig) {
+    do_cleanup();
+    signal(sig, SIG_DFL);
+    raise(sig);
 }
 
 static void mac_to_str(const uint8_t *mac, char *buf, size_t len) {
@@ -659,6 +672,7 @@ found_remote:
     uint64_t last_wifi = 0, last_eth = 0, last_arp = 0, last_utun = 0;
     uint64_t poll_errors = 0;
     time_t last_log = time(NULL);
+    const int is_tty = isatty(STDERR_FILENO);
 
     while (running) {
         struct pollfd pfds[3] = {
@@ -668,15 +682,22 @@ found_remote:
         };
         int pr = poll(pfds, 3, 500);
 
-        /* Periodic heartbeat every 5s with deltas — helps diagnose spins,
-           stalls, or skewed throughput between the three paths. */
+        /* Periodic heartbeat every 5s with deltas. On a TTY we overwrite
+           the previous heartbeat in place using CR + ANSI erase-to-EOL;
+           on a pipe/file we print a full line. Errors always end with \n,
+           so they scroll past the heartbeat cleanly. */
         time_t now = time(NULL);
         if (now - last_log >= 5) {
+            const char *prefix = is_tty ? "\r\033[K" : "";
+            const char *suffix = is_tty ? ""       : "\n";
             fprintf(stderr,
-                "macbridge: [hb] utun->eth=+%llu wifi->eth=+%llu eth->wifi=+%llu arp=+%llu poll_err=%llu\n",
+                "%smacbridge: [hb] utun->eth=+%llu wifi->eth=+%llu "
+                "eth->wifi=+%llu arp=+%llu poll_err=%llu%s",
+                prefix,
                 utun_to_eth - last_utun, wifi_to_eth - last_wifi,
                 eth_to_wifi - last_eth, arp_proxied - last_arp,
-                poll_errors);
+                poll_errors, suffix);
+            if (is_tty) fflush(stderr);
             last_utun = utun_to_eth; last_wifi = wifi_to_eth;
             last_eth = eth_to_wifi; last_arp = arp_proxied;
             last_log = now;
@@ -854,9 +875,11 @@ found_remote:
         }
     }
 
+    /* Leading \n so we drop off the in-place heartbeat line cleanly */
     fprintf(stderr,
-        "\nmacbridge: stopped. utun->eth=%llu wifi->eth=%llu eth->wifi=%llu arp=%llu\n",
-        utun_to_eth, wifi_to_eth, eth_to_wifi, arp_proxied);
+        "\nmacbridge: stopped. utun->eth=%llu wifi->eth=%llu eth->wifi=%llu "
+        "arp=%llu poll_err=%llu\n",
+        utun_to_eth, wifi_to_eth, eth_to_wifi, arp_proxied, poll_errors);
 
     free(wbuf);
     free(ebuf);
@@ -909,6 +932,12 @@ int main(int argc, char **argv) {
     check_interface_was = get_sysctl_int("net.inet.ip.check_interface");
     fprintf(stderr, "macbridge: check_interface was %d\n", check_interface_was);
 
+    /* Register cleanup for normal exit AND fatal signals */
+    atexit(do_cleanup);
+    signal(SIGSEGV, handle_fatal);
+    signal(SIGBUS, handle_fatal);
+    signal(SIGABRT, handle_fatal);
+
     /* Discover interfaces and gateway — needed for dnsmasq setup */
     uint8_t wifi_mac[ETH_ALEN], eth_mac[ETH_ALEN];
     char macstr[32];
@@ -950,51 +979,90 @@ int main(int argc, char **argv) {
     fprintf(stderr, "macbridge: %s IP = %s\n", wifi_if,
             inet_ntoa((struct in_addr){.s_addr = wifi_ip}));
 
-    /* Start dnsmasq in the WATCHDOG so it can be cleaned up */
-    dnsmasq_pid = start_dhcp(eth_if, remote_ip_str, gw_ip);
-    if (dnsmasq_pid < 0) return 1;
-
-    /* Fork the bridge child */
-    bridge_pid = fork();
-    if (bridge_pid < 0) {
-        perror("fork");
-        return 1;
-    }
-
-    if (bridge_pid == 0) {
-        /* === CHILD: run the bridge === */
-        signal(SIGINT, handle_signal);
-        signal(SIGTERM, handle_signal);
-        signal(SIGHUP, handle_signal);
-        signal(SIGPIPE, SIG_IGN);
-        int rc = run_bridge(wifi_if, eth_if, remote_ip_str, remote_ip, gw_ip, wifi_ip);
-        _exit(rc);
-    }
-
-    /* === PARENT: watchdog === */
-    /* Forward all termination signals to the child */
+    /* Install watchdog signal handlers BEFORE spawning anything.
+       The child will override INT/TERM/HUP for itself after fork. */
     signal(SIGINT, watchdog_signal);
     signal(SIGTERM, watchdog_signal);
     signal(SIGHUP, watchdog_signal);
     signal(SIGQUIT, watchdog_signal);
     signal(SIGPIPE, SIG_IGN);
 
-    /* Wait for child to exit — blocks until ANY exit */
-    int status;
-    waitpid(bridge_pid, &status, 0);
-    bridge_pid = 0;
+    /*
+     * Supervisor loop: keep the bridge alive until the user sends a
+     * termination signal. On any child exit (crash, error, remote
+     * unreachable, etc.) we re-run setup and fork a new child.
+     *
+     * dnsmasq is also (re-)started each iteration so it re-binds to
+     * en10 after a USB re-enumeration or configd reset that wiped
+     * our static IP. ARP and utun are re-initialized by the child.
+     */
+    int iteration = 0;
+    int last_exit = 0;
+    while (!user_quit) {
+        if (iteration > 0) {
+            fprintf(stderr, "\nmacbridge: restarting (attempt #%d)...\n",
+                    iteration + 1);
+        }
+        iteration++;
 
-    if (WIFEXITED(status)) {
-        fprintf(stderr, "macbridge: bridge exited with code %d\n",
-                WEXITSTATUS(status));
-    } else if (WIFSIGNALED(status)) {
-        fprintf(stderr, "macbridge: bridge killed by signal %d\n",
-                WTERMSIG(status));
+        /* (Re)start dnsmasq. Kill any stale one first. */
+        if (dnsmasq_pid > 0) {
+            kill(dnsmasq_pid, SIGTERM);
+            waitpid(dnsmasq_pid, NULL, 0);
+            dnsmasq_pid = 0;
+        }
+        dnsmasq_pid = start_dhcp(eth_if, remote_ip_str, gw_ip);
+        if (dnsmasq_pid < 0) {
+            if (user_quit) break;
+            fprintf(stderr, "macbridge: dnsmasq start failed, retry in 5s\n");
+            sleep(5);
+            continue;
+        }
+
+        /* Fork the bridge child */
+        bridge_pid = fork();
+        if (bridge_pid < 0) {
+            perror("fork");
+            if (user_quit) break;
+            sleep(5);
+            continue;
+        }
+
+        if (bridge_pid == 0) {
+            /* === CHILD === */
+            signal(SIGINT, handle_signal);
+            signal(SIGTERM, handle_signal);
+            signal(SIGHUP, handle_signal);
+            signal(SIGPIPE, SIG_IGN);
+            int rc = run_bridge(wifi_if, eth_if, remote_ip_str,
+                                remote_ip, gw_ip, wifi_ip);
+            _exit(rc);
+        }
+
+        /* === PARENT waits for child === */
+        int status;
+        while (waitpid(bridge_pid, &status, 0) < 0 && errno == EINTR) { }
+        bridge_pid = 0;
+
+        if (WIFEXITED(status)) {
+            last_exit = WEXITSTATUS(status);
+            fprintf(stderr, "\nmacbridge: bridge exited with code %d\n",
+                    last_exit);
+        } else if (WIFSIGNALED(status)) {
+            fprintf(stderr, "\nmacbridge: bridge killed by signal %d\n",
+                    WTERMSIG(status));
+            last_exit = 128 + WTERMSIG(status);
+        }
+
+        if (user_quit) break;
+
+        /* Transient failure — brief backoff, then try again. */
+        fprintf(stderr, "macbridge: sleeping 3s before retry "
+                        "(Ctrl+C to stop)\n");
+        for (int i = 0; i < 3 && !user_quit; i++) sleep(1);
     }
 
-    /* Cleanup ALWAYS runs here — safe context, not a signal handler */
-    do_cleanup();
-    fprintf(stderr, "macbridge: all clean\n");
-
-    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    /* do_cleanup() runs via atexit — kills dnsmasq, restores check_interface */
+    fprintf(stderr, "macbridge: user requested exit\n");
+    return last_exit;
 }

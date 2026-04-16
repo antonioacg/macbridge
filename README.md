@@ -64,6 +64,14 @@ Three data paths:
 
 See [CLAUDE.md](CLAUDE.md) for measured numbers, gotchas (utun byte order, macOS routing quirks), and design notes.
 
+## Resilience
+
+macbridge supervises itself. The parent process forks a bridge child, and when the child exits for *any* reason (interface reset by `configd` after USB re-enumeration, `poll()` errors, crash, etc.), the parent respawns it after a 3-second backoff — including re-applying the Ethernet IP and restarting dnsmasq so it re-binds to the restored address.
+
+Only a termination signal (`SIGINT` / `SIGTERM` / `SIGHUP` / `SIGQUIT`) sent to the parent stops the loop. You can put the Mac to sleep, reboot the remote, swap cables — when everything settles, macbridge is back without intervention.
+
+A heartbeat prints every 5 seconds with per-path packet deltas. On a TTY it overwrites in place; in a pipe/file it appends full lines.
+
 ## Cleanup guarantee
 
 macbridge uses a watchdog process pattern:

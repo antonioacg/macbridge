@@ -101,14 +101,16 @@ dnsmasq is fork/exec'd by the watchdog (not the bridge child) so the watchdog ca
 ### USB Ethernet re-enumeration (Mac sleep, remote reboot)
 Symptoms: bridge at ~100% CPU, en10 IP is `169.254.x.x` (link-local), dnsmasq logs "DHCP packet received on en10 which has no address".
 
-Cause: USB re-enumeration triggers macOS `configd` to reset en10. Our `ifconfig 192.168.0.241` is wiped. BPF fds bound via `BIOCSETIF "en10"` may go stale if the interface index changed. `poll()` starts returning `-1` persistently, and the old loop `if (poll(...) <= 0) continue;` busy-loops.
+Cause: USB re-enumeration triggers macOS `configd` to reset en10. Our `ifconfig 192.168.0.241` is wiped. BPF fds bound via `BIOCSETIF "en10"` may go stale if the interface index changed. `poll()` starts returning `-1` persistently.
 
 Handling (as of this version):
-- poll() errors are logged with `errno` and the child exits (watchdog cleans up).
-- Each BPF/utun `read()` error also exits.
-- Heartbeat every 5s shows per-path deltas — stalled paths are visible.
+- **Supervisor loop**: the watchdog keeps respawning the bridge child. Only a user signal (SIGINT/SIGTERM/SIGHUP/SIGQUIT) stops the loop.
+- **Fail-fast in the child**: `poll()` or `read()` errors immediately exit the child with `errno` logged. Watchdog re-runs setup (including re-applying the en10 IP via `ifconfig` and restarting dnsmasq so it re-binds).
+- **Heartbeat every 5s** shows per-path packet deltas (`utun->eth`, `wifi->eth`, `eth->wifi`, `arp`, `poll_err`). On a TTY it overwrites the previous heartbeat in place using `\r\033[K`; on a pipe it appends a full line.
 
-Recovery: restart the bridge. Long-term fix (not yet implemented): listen on a `kqueue`/route-socket for link-state events on en10, re-apply the IP, and reopen BPF if needed.
+Recovery is automatic after a Mac sleep + remote reboot: within a few seconds the watchdog has a new child running and DHCP leases are handed out again.
+
+Long-term fix (not yet implemented): listen on a `kqueue`/route-socket for link-state events on en10 and recover in place, without tearing down dnsmasq and the BPF fds.
 
 ## Performance
 
