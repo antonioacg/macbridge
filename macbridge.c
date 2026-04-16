@@ -22,6 +22,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <poll.h>
+#include <time.h>
 #include <net/bpf.h>
 #include <net/if.h>
 #include <net/if_utun.h>
@@ -655,6 +656,9 @@ found_remote:
     if (!wbuf || !ebuf || !ubuf) { perror("malloc"); return 1; }
 
     uint64_t wifi_to_eth = 0, eth_to_wifi = 0, arp_proxied = 0, utun_to_eth = 0;
+    uint64_t last_wifi = 0, last_eth = 0, last_arp = 0, last_utun = 0;
+    uint64_t poll_errors = 0;
+    time_t last_log = time(NULL);
 
     while (running) {
         struct pollfd pfds[3] = {
@@ -662,7 +666,43 @@ found_remote:
             { .fd = bpf_eth,  .events = POLLIN },
             { .fd = utun_fd,  .events = POLLIN },
         };
-        if (poll(pfds, 3, 500) <= 0) continue;
+        int pr = poll(pfds, 3, 500);
+
+        /* Periodic heartbeat every 5s with deltas — helps diagnose spins,
+           stalls, or skewed throughput between the three paths. */
+        time_t now = time(NULL);
+        if (now - last_log >= 5) {
+            fprintf(stderr,
+                "macbridge: [hb] utun->eth=+%llu wifi->eth=+%llu eth->wifi=+%llu arp=+%llu poll_err=%llu\n",
+                utun_to_eth - last_utun, wifi_to_eth - last_wifi,
+                eth_to_wifi - last_eth, arp_proxied - last_arp,
+                poll_errors);
+            last_utun = utun_to_eth; last_wifi = wifi_to_eth;
+            last_eth = eth_to_wifi; last_arp = arp_proxied;
+            last_log = now;
+        }
+
+        if (pr == 0) continue;  /* timeout, normal */
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            poll_errors++;
+            fprintf(stderr, "macbridge: poll() failed: %s (errno=%d). "
+                            "fds may be stale (USB re-enum? interface removed?). "
+                            "Exiting so watchdog can clean up.\n",
+                    strerror(errno), errno);
+            return 1;  /* fail fast — watchdog handles cleanup */
+        }
+
+        /* Check for unexpected revents (POLLERR/POLLHUP/POLLNVAL) */
+        for (int i = 0; i < 3; i++) {
+            if (pfds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                const char *names[] = {"wifi", "eth", "utun"};
+                fprintf(stderr,
+                    "macbridge: %s fd has error (revents=0x%x). Exiting.\n",
+                    names[i], pfds[i].revents);
+                return 1;
+            }
+        }
 
         /*
          * utun -> Eth: Mac's own traffic to remote_ip.
@@ -672,6 +712,11 @@ found_remote:
          */
         if (pfds[2].revents & POLLIN) {
             ssize_t n = read(utun_fd, ubuf, 2048);
+            if (n < 0) {
+                fprintf(stderr, "macbridge: utun read failed: %s. Exiting.\n",
+                        strerror(errno));
+                return 1;
+            }
             /* utun prepends 4 bytes of address family in NETWORK byte order */
             if (n > 4) {
                 uint32_t af = ntohl(*(uint32_t *)ubuf);
@@ -694,6 +739,11 @@ found_remote:
         /* Wi-Fi -> Eth */
         if (pfds[0].revents & POLLIN) {
             ssize_t n = read(bpf_wifi, wbuf, wifi_buflen);
+            if (n < 0) {
+                fprintf(stderr, "macbridge: wifi BPF read failed: %s. Exiting.\n",
+                        strerror(errno));
+                return 1;
+            }
             if (n > 0) {
                 uint8_t *p = wbuf;
                 while (p < wbuf + n) {
@@ -741,6 +791,11 @@ found_remote:
         /* Eth -> Wi-Fi */
         if (pfds[1].revents & POLLIN) {
             ssize_t n = read(bpf_eth, ebuf, eth_buflen);
+            if (n < 0) {
+                fprintf(stderr, "macbridge: eth BPF read failed: %s. Exiting.\n",
+                        strerror(errno));
+                return 1;
+            }
             if (n > 0) {
                 uint8_t *p = ebuf;
                 while (p < ebuf + n) {

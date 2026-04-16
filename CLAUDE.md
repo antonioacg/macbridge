@@ -98,6 +98,18 @@ dnsmasq is fork/exec'd by the watchdog (not the bridge child) so the watchdog ca
 - Only happens if watchdog itself is `kill -9`'d
 - Fix: `sudo pkill dnsmasq; sudo sysctl -w net.inet.ip.check_interface=1; sudo arp -d <ip>`
 
+### USB Ethernet re-enumeration (Mac sleep, remote reboot)
+Symptoms: bridge at ~100% CPU, en10 IP is `169.254.x.x` (link-local), dnsmasq logs "DHCP packet received on en10 which has no address".
+
+Cause: USB re-enumeration triggers macOS `configd` to reset en10. Our `ifconfig 192.168.0.241` is wiped. BPF fds bound via `BIOCSETIF "en10"` may go stale if the interface index changed. `poll()` starts returning `-1` persistently, and the old loop `if (poll(...) <= 0) continue;` busy-loops.
+
+Handling (as of this version):
+- poll() errors are logged with `errno` and the child exits (watchdog cleans up).
+- Each BPF/utun `read()` error also exits.
+- Heartbeat every 5s shows per-path deltas — stalled paths are visible.
+
+Recovery: restart the bridge. Long-term fix (not yet implemented): listen on a `kqueue`/route-socket for link-state events on en10, re-apply the IP, and reopen BPF if needed.
+
 ## Performance
 
 ### Measured throughput (Mac ↔ OrangePi 5 Pro over USB Gigabit + Wi-Fi)
