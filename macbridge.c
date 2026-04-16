@@ -24,6 +24,7 @@
 #include <poll.h>
 #include <net/bpf.h>
 #include <net/if.h>
+#include <net/if_utun.h>
 #include <net/ethernet.h>
 #include <net/if_arp.h>
 #include <netinet/in.h>
@@ -32,6 +33,8 @@
 #include <sys/socket.h>
 #include <sys/sysctl.h>
 #include <sys/wait.h>
+#include <sys/kern_control.h>
+#include <sys/sys_domain.h>
 #include <net/route.h>
 #include <ifaddrs.h>
 #include <net/if_dl.h>
@@ -473,6 +476,71 @@ static pid_t start_dhcp(const char *eth_if, const char *remote_ip,
     return pid;
 }
 
+/*
+ * Create a utun interface for the Mac -> Remote fast path.
+ *
+ * The kernel routes packets destined to remote_ip via utun instead of en0,
+ * so they never hit the Wi-Fi driver. We read IP packets from utun here,
+ * wrap them in an Ethernet header, and inject directly on en10.
+ *
+ * utun is a PF_SYSTEM/SYSPROTO_CONTROL socket. Each packet read/written
+ * is prefixed with a 4-byte address family (host byte order on Darwin).
+ *
+ * We use P2P mode: self=172.16.0.1, peer=remote_ip. This automatically
+ * creates a host route remote_ip -> utun0 that wins over en0's /24
+ * (longest-prefix-match). Source IP on the Mac side is 172.16.0.1;
+ * the remote replies to that address and its default gateway (eth_mac
+ * on en10) delivers the reply back to us via the normal bridge path.
+ */
+static int create_utun(const char *remote_ip_str, char *ifname_out,
+                       size_t ifname_size) {
+    int fd = socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
+    if (fd < 0) { perror("socket PF_SYSTEM"); return -1; }
+
+    struct ctl_info info;
+    memset(&info, 0, sizeof(info));
+    strlcpy(info.ctl_name, UTUN_CONTROL_NAME, sizeof(info.ctl_name));
+    if (ioctl(fd, CTLIOCGINFO, &info) < 0) {
+        perror("CTLIOCGINFO utun");
+        close(fd); return -1;
+    }
+
+    struct sockaddr_ctl sc;
+    memset(&sc, 0, sizeof(sc));
+    sc.sc_id = info.ctl_id;
+    sc.sc_len = sizeof(sc);
+    sc.sc_family = AF_SYSTEM;
+    sc.ss_sysaddr = AF_SYS_CONTROL;
+    sc.sc_unit = 0;  /* 0 = auto-pick next free utun unit */
+
+    if (connect(fd, (struct sockaddr *)&sc, sizeof(sc)) < 0) {
+        perror("connect utun");
+        close(fd); return -1;
+    }
+
+    /* Retrieve the assigned interface name (utunN) */
+    socklen_t iflen = ifname_size;
+    if (getsockopt(fd, SYSPROTO_CONTROL, UTUN_OPT_IFNAME,
+                   ifname_out, &iflen) < 0) {
+        perror("getsockopt UTUN_OPT_IFNAME");
+        close(fd); return -1;
+    }
+
+    /* P2P config: self=172.16.0.1, peer=remote_ip (creates host route) */
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd),
+             "ifconfig %s inet 172.16.0.1 %s netmask 255.255.255.255 up",
+             ifname_out, remote_ip_str);
+    if (system(cmd) != 0) {
+        fprintf(stderr, "macbridge: ifconfig on %s failed\n", ifname_out);
+        close(fd); return -1;
+    }
+
+    fprintf(stderr, "macbridge: %s up, host route %s -> %s\n",
+            ifname_out, remote_ip_str, ifname_out);
+    return fd;
+}
+
 static int run_bridge(const char *wifi_if, const char *eth_if,
                       const char *remote_ip_str, uint32_t remote_ip,
                       uint32_t gw_ip, uint32_t wifi_ip) {
@@ -552,22 +620,24 @@ found_remote:
 
     close(bpf_wifi);
     close(bpf_eth);
-    bpf_wifi = open_bpf(wifi_if, &wifi_buflen, 1, &wifi_filter, 1);
+    /* Wi-Fi BPF: see_sent=0 — Mac's own traffic to remote now goes via utun,
+       so we only need incoming from the LAN (external devices reaching the
+       remote). Dropping see_sent=1 cuts Wi-Fi noise dramatically. */
+    bpf_wifi = open_bpf(wifi_if, &wifi_buflen, 0, &wifi_filter, 1);
     if (bpf_wifi < 0) return 1;
     bpf_eth = open_bpf(eth_if, &eth_buflen, 0, &eth_filter, 1);
     if (bpf_eth < 0) { close(bpf_wifi); return 1; }
 
-    /* Enable weak host model */
-    system("sysctl -w net.inet.ip.check_interface=0 >/dev/null 2>&1");
-
-    /* Pre-populate ARP so Mac can send to remote (BPF captures outgoing) */
-    {
-        char cmd[128];
-        mac_to_str(remote_mac, macstr, sizeof(macstr));
-        snprintf(cmd, sizeof(cmd), "arp -d %s 2>/dev/null; arp -s %s %s",
-                 remote_ip_str, remote_ip_str, macstr);
-        system(cmd);
+    /* Create utun for the Mac -> Remote fast path (bypasses Wi-Fi entirely) */
+    char utun_name[16];
+    int utun_fd = create_utun(remote_ip_str, utun_name, sizeof(utun_name));
+    if (utun_fd < 0) {
+        close(bpf_wifi); close(bpf_eth);
+        return 1;
     }
+
+    /* Enable weak host model — replies on en10 for utun's IPs still accepted */
+    system("sysctl -w net.inet.ip.check_interface=0 >/dev/null 2>&1");
 
     /* Enable IP forwarding for OrangePi's outgoing traffic */
     system("sysctl -w net.inet.ip.forwarding=1 >/dev/null 2>&1");
@@ -575,22 +645,51 @@ found_remote:
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
-    fprintf(stderr, "\nmacbridge: bridging active — %s <-> %s (%s)\n",
-            wifi_if, remote_ip_str, eth_if);
+    fprintf(stderr, "\nmacbridge: bridging active — %s <-> %s (%s, via %s)\n",
+            wifi_if, remote_ip_str, eth_if, utun_name);
     fprintf(stderr, "macbridge: Ctrl+C to stop\n\n");
 
     uint8_t *wbuf = malloc(wifi_buflen);
     uint8_t *ebuf = malloc(eth_buflen);
-    if (!wbuf || !ebuf) { perror("malloc"); return 1; }
+    uint8_t *ubuf = malloc(2048);   /* utun packet buffer (max ~1500 + hdr) */
+    if (!wbuf || !ebuf || !ubuf) { perror("malloc"); return 1; }
 
-    uint64_t wifi_to_eth = 0, eth_to_wifi = 0, arp_proxied = 0;
+    uint64_t wifi_to_eth = 0, eth_to_wifi = 0, arp_proxied = 0, utun_to_eth = 0;
 
     while (running) {
-        struct pollfd pfds[2] = {
+        struct pollfd pfds[3] = {
             { .fd = bpf_wifi, .events = POLLIN },
             { .fd = bpf_eth,  .events = POLLIN },
+            { .fd = utun_fd,  .events = POLLIN },
         };
-        if (poll(pfds, 2, 500) <= 0) continue;
+        if (poll(pfds, 3, 500) <= 0) continue;
+
+        /*
+         * utun -> Eth: Mac's own traffic to remote_ip.
+         * Kernel routes to utun0, we read the IP packet here, wrap it in
+         * an Ethernet header addressed to the remote, and inject on en10.
+         * This completely bypasses the Wi-Fi driver — no wasted airtime.
+         */
+        if (pfds[2].revents & POLLIN) {
+            ssize_t n = read(utun_fd, ubuf, 2048);
+            /* utun prepends 4 bytes of address family in NETWORK byte order */
+            if (n > 4) {
+                uint32_t af = ntohl(*(uint32_t *)ubuf);
+                if (af == AF_INET) {
+                    /* Build Ethernet frame: dst=remote_mac, src=eth_mac,
+                       type=IPv4. Payload = the IP packet we just read. */
+                    uint8_t frame[2048];
+                    struct ether_header *eh = (struct ether_header *)frame;
+                    memcpy(eh->ether_dhost, remote_mac, ETH_ALEN);
+                    memcpy(eh->ether_shost, eth_mac, ETH_ALEN);
+                    eh->ether_type = htons(ETHERTYPE_IP);
+                    size_t ip_len = n - 4;
+                    memcpy(frame + sizeof(*eh), ubuf + 4, ip_len);
+                    write(bpf_eth, frame, sizeof(*eh) + ip_len);
+                    utun_to_eth++;
+                }
+            }
+        }
 
         /* Wi-Fi -> Eth */
         if (pfds[0].revents & POLLIN) {
@@ -607,23 +706,11 @@ found_remote:
                     struct ether_header *eh = (struct ether_header *)frame;
                     uint16_t ethertype = ntohs(eh->ether_type);
 
-                    /* Skip our own injected packets (src=wifi_mac, srcIP=remote) */
-                    if (memcmp(eh->ether_shost, wifi_mac, ETH_ALEN) == 0 &&
-                        ethertype == ETHERTYPE_IP &&
-                        framelen >= sizeof(struct ether_header) + 20) {
-                        struct ip *iph = (struct ip *)(frame + sizeof(struct ether_header));
-                        if (iph->ip_src.s_addr == remote_ip)
-                            continue;
-                    }
-
-                    /* ARP: proxy for remote, learn others */
+                    /* ARP: proxy for remote, learn others.
+                       With see_sent=0 we no longer capture our own injected
+                       replies, so the old skip-self logic is gone. */
                     if (ethertype == ETHERTYPE_ARP && framelen >= sizeof(struct arp_packet)) {
                         struct arp_packet *arp = (struct arp_packet *)frame;
-                        if (ntohs(arp->operation) == ARP_OP_REPLY &&
-                            arp->sender_ip == remote_ip &&
-                            memcmp(arp->sender_mac, wifi_mac, ETH_ALEN) == 0)
-                            continue;
-
                         if (ntohs(arp->operation) == ARP_OP_REQUEST &&
                             arp->target_ip == remote_ip) {
                             send_arp_reply(bpf_wifi, wifi_mac, remote_ip,
@@ -712,13 +799,16 @@ found_remote:
         }
     }
 
-    fprintf(stderr, "\nmacbridge: stopped. wifi->eth=%llu eth->wifi=%llu arp=%llu\n",
-            wifi_to_eth, eth_to_wifi, arp_proxied);
+    fprintf(stderr,
+        "\nmacbridge: stopped. utun->eth=%llu wifi->eth=%llu eth->wifi=%llu arp=%llu\n",
+        utun_to_eth, wifi_to_eth, eth_to_wifi, arp_proxied);
 
     free(wbuf);
     free(ebuf);
+    free(ubuf);
     close(bpf_wifi);
     close(bpf_eth);
+    close(utun_fd);  /* destroys the utun interface and its host route */
     return 0;
 }
 

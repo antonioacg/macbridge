@@ -38,22 +38,31 @@ Find your interfaces with `networksetup -listallhardwareports`.
 ## How it works
 
 ```
-┌─────────┐         ┌───────────┐         ┌────────┐
-│  Wi-Fi  │◄──BPF──►│ macbridge │◄──BPF──►│  USB   │
-│  (en0)  │         │           │         │ (en10) │
-└────┬────┘         └───────────┘         └───┬────┘
-     │                                        │
- 192.168.0.0/24                          Remote device
- (router, LAN)                         192.168.0.100
+                    ┌───────────────────────┐
+                    │       macbridge       │
+  Mac apps ───utun──►                       ├──BPF──► USB Ethernet ──► remote
+                    │                       │
+  LAN peers ──BPF──►  (MAC/header rewrite)  ├──BPF──► USB Ethernet ──► remote
+    (Wi-Fi)         │                       │
+                    │                       ◄──BPF── USB Ethernet ◄── remote
+                    └───────────────────────┘
 ```
 
-- **Wi-Fi → Ethernet**: Packets destined for the remote IP arrive with the Mac's Wi-Fi MAC (proxy ARP). macbridge rewrites dst MAC to the remote's real MAC and injects on Ethernet.
-- **Ethernet → Wi-Fi**: Packets from the remote are rewritten with the Mac's Wi-Fi MAC as source and injected on Wi-Fi, appearing to come from the Mac.
-- **ARP proxy**: macbridge answers ARP requests for the remote IP on Wi-Fi, and answers all ARP requests from the remote on Ethernet (acting as the entire network).
+Three data paths:
+
+- **Mac → Remote (utun fast path)**: A host route `remote_ip -> utun0` takes priority over Wi-Fi's connected subnet. The kernel hands IP packets to utun; macbridge prepends an Ethernet header and injects on USB. Wi-Fi is never involved.
+- **LAN → Remote (proxy ARP path)**: macbridge answers ARP for `remote_ip` on Wi-Fi with the Mac's Wi-Fi MAC. LAN peers send frames to the Mac's Wi-Fi MAC; BPF captures, MACs are rewritten, frame is injected on USB.
+- **Remote → anywhere**: BPF on USB captures frames from the remote, rewrites src MAC to the Mac's Wi-Fi MAC, and injects on Wi-Fi to the router or LAN peer. Replies directed at the Mac itself are handled by the kernel (weak host model) without going through the bridge.
 
 ## Performance
 
-Roughly gigabit-class with TCP, limited in practice by your Wi-Fi uplink. Uses kernel-side cBPF filters and 4 MB BPF buffers so the kernel drops irrelevant frames before they reach userspace. See [CLAUDE.md](CLAUDE.md) for measured numbers and design notes.
+~300 Mbps bidirectional on the test hardware (MacBook + USB Gigabit + OrangePi 5 Pro). Key optimizations:
+
+- **utun fast path** for Mac → Remote — bypasses the Wi-Fi driver entirely (otherwise every packet gets transmitted over the air too and wastes airtime).
+- **Kernel-side cBPF filters** — kernel drops irrelevant frames before they hit the userspace buffer.
+- **4 MB BPF buffers** — absorbs bursts without drops.
+
+See [CLAUDE.md](CLAUDE.md) for measured numbers, gotchas (utun byte order, macOS routing quirks), and design notes.
 
 ## Cleanup guarantee
 

@@ -104,36 +104,70 @@ dnsmasq is fork/exec'd by the watchdog (not the bridge child) so the watchdog ca
 
 | Direction | Throughput | Notes |
 |---|---|---|
-| Remote → Mac | 332 Mbps, 0 retrans | Bridge bypassed (dst = wifi_ip, skip path) |
-| Mac → Remote (TCP) | 63 Mbps, 0 retrans | Wi-Fi uplink is the ceiling |
-| Mac → Remote (UDP) | 60 Mbps, <1% loss | Same ceiling |
+| Remote → Mac | ~310 Mbps, 0 retrans | Bridge bypassed (dst = wifi_ip, kernel handles directly) |
+| Mac → Remote (TCP) | ~300 Mbps, some retrans | Via utun, bridge is the ceiling |
+| Mac → Remote (UDP 300M) | 300 Mbps, <0.1% loss | Sustainable rate |
+| Mac → Remote (UDP 500M) | 313 Mbps delivered, 37% loss | Bridge saturated above ~300 Mbps |
 
-Before filter+buffer fixes: 37 Mbps TCP with thousands of retransmits, 87% UDP loss.
+### Evolution
+| Version | Mac → Remote | Bottleneck |
+|---|---|---|
+| Initial (see_sent=1, no filter, 4KB buffer) | 37 Mbps, 2916 retrans | BPF buffer overflow |
+| + cBPF filter + 4MB buffer | 63 Mbps, 0 retrans | Wi-Fi uplink |
+| + utun fast path (current) | 300 Mbps, some retrans | Bridge syscall overhead |
 
-### Why Remote → Mac is faster
-That direction doesn't go through the bridge. The OrangePi sends IP packets to the Mac's en0 IP (via gateway eth_mac on en10), the kernel accepts them on en10 directly (weak host model), and the bridge's eth→wifi forwarding logic skips them (`dst_ip == wifi_ip`). So that path is pure kernel networking, not userspace packet rewriting.
+### Why utun matters — the Wi-Fi detour
+Before utun, every Mac → Remote packet was transmitted on Wi-Fi AND on Ethernet:
 
-### Why Mac → Remote went from 37 → 63 Mbps
-Two fixes, both required:
+1. Mac's kernel thinks `.100` lives on en0 (connected /24 subnet)
+2. Wi-Fi driver transmits the frame over the air with dst MAC = remote_mac
+3. AP drops it (unknown station)
+4. BPF (`see_sent=1`) captured the outgoing frame
+5. Bridge rewrote MACs, injected on en10 → remote receives
 
-1. **Kernel-side cBPF filter (`BIOCSETF`)**. Without a filter, BPF copies every frame on the wire into the userspace buffer — including all Wi-Fi chatter from unrelated hosts. Userspace then discards 99% of them. With a filter (`arp || (ip && dst host remote_ip)` on en0, `ether src host remote_mac` on en10), the kernel drops non-matching frames before buffering. Cuts kernel→user copy rate by 10-100x.
+Wasted Wi-Fi airtime on every packet. Wi-Fi is half-duplex and airtime-limited, so the wasted TX saturated the uplink at ~63 Mbps.
 
-2. **4 MB BPF buffer (`BIOCSBLEN` before `BIOCSETIF`)**. Default is 4 KB — overflows instantly under load. Drops happen in-kernel and are invisible to us. Request 4 MB up front, fall back by halving if the kernel rejects. macOS accepted 4 MB without complaint.
+### How utun bypasses Wi-Fi
+`utun` is a PF_SYSTEM/SYSPROTO_CONTROL virtual interface. We create it with P2P mode (`self=172.16.0.1, peer=192.168.0.100`), which creates a host route `192.168.0.100 -> utun0`. This /32 route wins against en0's /24 connected route (longest-prefix-match).
 
-### Remaining ceiling
-60-65 Mbps is the Wi-Fi uplink from this Mac to this AP. Confirmed by multi-stream iperf (same aggregate). For higher throughput you'd need a faster Wi-Fi link or ethernet-to-ethernet.
+Now when the Mac sends to `.100`:
+1. Kernel routes via utun0 (not en0!)
+2. Packet written to utun → userspace reads it
+3. Bridge prepends Ethernet header, writes to en10 BPF
+4. Remote receives — Wi-Fi never sees the packet
+
+Reply from remote: sent to `172.16.0.1` (Mac's source on utun). Remote's gateway is `eth_mac` on en10, so the reply arrives on en10. Kernel accepts because `172.16.0.1` is a local IP (utun0) — weak host model takes care of the interface mismatch.
+
+### utun gotchas
+- **AF prefix is in NETWORK byte order**, not host. Every packet read/written has a 4-byte prefix = `htonl(AF_INET)` = `0x02000000` on the wire. Comments in Apple headers and random SO answers say "host byte order" — they're wrong. Verified empirically.
+- **Interface destroyed when fd closes** — no cleanup needed beyond `close()`.
+- **No Ethernet header on utun** (it's L3). We prepend one before BPF write.
+- **Only IPv4 traffic forwarded** — IPv6 (AF_INET6) would need its own ethertype (0x86DD). Not implemented; easy to add.
+
+### Kernel-side cBPF filter (`BIOCSETF`)
+Without a filter, BPF copies every frame on the wire into the userspace buffer — including unrelated Wi-Fi chatter. Userspace then discards 99%. With a filter (`arp || (ip && dst host remote_ip)` on en0, `ether src host remote_mac` on en10), the kernel drops non-matching frames before buffering. Cuts kernel→user copy rate by 10-100x.
+
+### 4 MB BPF buffer (`BIOCSBLEN` before `BIOCSETIF`)
+Default is 4 KB — overflows instantly under load. Drops happen in-kernel and are invisible to us. Request 4 MB up front, halve and retry if the kernel rejects. macOS Sequoia accepted 4 MB without complaint.
+
+### Remaining ceiling (~300 Mbps)
+The bridge is now syscall-bound. Each Mac → Remote packet costs:
+- 1 `read()` from utun (kernel → user copy)
+- 1 `write()` to en10 BPF (user → kernel copy)
+- Plus `poll()` overhead
+
+At MTU-sized packets, that's ~25k pps × 2 syscalls = ~50k syscalls/sec. Each is 1-3μs → ~50-150ms of wall time per second spent in syscall overhead. The remaining time is the kernel driver path.
 
 ### What's NOT available on macOS for further gains
-- **Zero-copy BPF** (`BIOCSETBUFMODE` + `BPF_BUFMODE_ZBUF`): FreeBSD has it, Darwin doesn't. The kernel→user copy for every packet is mandatory on macOS.
+- **Zero-copy BPF** (`BIOCSETBUFMODE` + `BPF_BUFMODE_ZBUF`): FreeBSD has it, Darwin doesn't.
 - **AF_PACKET / PF_PACKET sockets**: Linux-only.
-- **TUN/TAP with kernel bridge**: macOS has utun (L3 only, no L2). No native TAP without a kext.
-
-The ceiling for a pure-userspace BPF bridge on macOS is roughly 1-2 Gbps on modern hardware with these optimizations. Beyond that requires a system extension (Network Extension framework) or kext.
+- **Native TAP** (L2 virtual interface): Requires a kext. `tuntaposx` is dead.
 
 ### If you want more throughput
-- Disable `BIOCIMMEDIATE` (set to 0) — kernel batches packets, trading latency for throughput. Good for bulk transfers, bad for ping/SSH.
-- Multiple BPF reader threads with `pthread` — one per interface instead of shared `poll()`.
-- Preallocate packet buffers, avoid any allocation in the hot path (already done).
+- Disable `BIOCIMMEDIATE` — kernel batches packets, trades latency for throughput.
+- Multi-thread: one thread per fd instead of shared `poll()`. Reduces head-of-line blocking between utun reads and BPF writes.
+- Read multiple packets per `read()` from utun when they queue up (check the fd with another poll loop internally).
+- Network Extension (`NEPacketTunnelProvider`) for a sanctioned kernel fast-path. Bigger rewrite, needs codesigning + entitlements.
 
 ## Build
 
