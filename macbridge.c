@@ -1018,6 +1018,14 @@ int main(int argc, char **argv) {
     signal(SIGBUS, handle_fatal);
     signal(SIGABRT, handle_fatal);
 
+    /* Install watchdog signal handlers now so Ctrl+C works even while
+       we're waiting for the USB adapter to appear. */
+    signal(SIGINT, watchdog_signal);
+    signal(SIGTERM, watchdog_signal);
+    signal(SIGHUP, watchdog_signal);
+    signal(SIGQUIT, watchdog_signal);
+    signal(SIGPIPE, SIG_IGN);
+
     /* Discover interfaces and gateway — needed for dnsmasq setup */
     uint8_t wifi_mac[ETH_ALEN], eth_mac[ETH_ALEN];
     char macstr[32];
@@ -1028,6 +1036,18 @@ int main(int argc, char **argv) {
     }
     mac_to_str(wifi_mac, macstr, sizeof(macstr));
     fprintf(stderr, "macbridge: %s MAC = %s\n", wifi_if, macstr);
+
+    /* Wait for the USB Ethernet adapter if it isn't present yet. */
+    if (if_nametoindex(eth_if) == 0) {
+        fprintf(stderr,
+                "macbridge: %s not present — waiting for USB adapter "
+                "to be connected (Ctrl+C to stop)\n", eth_if);
+        while (!user_quit && if_nametoindex(eth_if) == 0) {
+            sleep(2);
+        }
+        if (user_quit) return 0;
+        fprintf(stderr, "macbridge: %s detected\n", eth_if);
+    }
 
     if (get_mac(eth_if, eth_mac) < 0) {
         fprintf(stderr, "Cannot get MAC for %s\n", eth_if);
@@ -1059,18 +1079,12 @@ int main(int argc, char **argv) {
     fprintf(stderr, "macbridge: %s IP = %s\n", wifi_if,
             inet_ntoa((struct in_addr){.s_addr = wifi_ip}));
 
-    /* Install watchdog signal handlers BEFORE spawning anything.
-       The child will override INT/TERM/HUP for itself after fork. */
-    signal(SIGINT, watchdog_signal);
-    signal(SIGTERM, watchdog_signal);
-    signal(SIGHUP, watchdog_signal);
-    signal(SIGQUIT, watchdog_signal);
-    signal(SIGPIPE, SIG_IGN);
-
     /*
      * Supervisor loop: keep the bridge alive until the user sends a
      * termination signal. On any child exit (crash, error, remote
      * unreachable, etc.) we re-run setup and fork a new child.
+     * Watchdog signal handlers were installed earlier (before the
+     * initial interface wait) so Ctrl+C works at every stage.
      *
      * dnsmasq is also (re-)started each iteration so it re-binds to
      * en10 after a USB re-enumeration or configd reset that wiped
@@ -1085,7 +1099,9 @@ int main(int argc, char **argv) {
         }
         iteration++;
 
-        /* (Re)start dnsmasq + forwarder. Kill any stale ones first. */
+        /* Kill any stale dnsmasq/forwarder BEFORE the interface wait so
+           we don't leave them running against a vanished en10 while we
+           idle. */
         if (dnsmasq_pid > 0) {
             kill(dnsmasq_pid, SIGTERM);
             waitpid(dnsmasq_pid, NULL, 0);
@@ -1095,6 +1111,23 @@ int main(int argc, char **argv) {
             kill(forwarder_pid, SIGTERM);
             waitpid(forwarder_pid, NULL, 0);
             forwarder_pid = 0;
+        }
+
+        /*
+         * If the USB Ethernet adapter is unplugged, en10 disappears from
+         * the kernel and every step below (ifconfig, dnsmasq bind, BPF
+         * BIOCSETIF) fails — turning the supervisor into a 3s retry
+         * storm. Poll quietly for the interface to come back instead.
+         */
+        if (if_nametoindex(eth_if) == 0) {
+            fprintf(stderr,
+                    "\nmacbridge: %s not present — waiting for USB "
+                    "adapter to return (Ctrl+C to stop)\n", eth_if);
+            while (!user_quit && if_nametoindex(eth_if) == 0) {
+                sleep(2);
+            }
+            if (user_quit) break;
+            fprintf(stderr, "macbridge: %s is back, resuming\n", eth_if);
         }
         dnsmasq_pid = start_dhcp(eth_if, remote_ip_str, gw_ip);
         if (dnsmasq_pid < 0) {
