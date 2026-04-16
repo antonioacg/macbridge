@@ -116,19 +116,29 @@ Long-term fix (not yet implemented): listen on a `kqueue`/route-socket for link-
 
 ### Measured throughput (Mac ↔ OrangePi 5 Pro over USB Gigabit + Wi-Fi)
 
+Adapter on USB 3.x bus directly (Realtek 0x0bda:0x8153, "Up to 5 Gb/s"):
+
 | Direction | Throughput | Notes |
 |---|---|---|
-| Remote → Mac | ~310 Mbps, 0 retrans | Bridge bypassed (dst = wifi_ip, kernel handles directly) |
-| Mac → Remote (TCP) | ~300 Mbps, some retrans | Via utun, bridge is the ceiling |
-| Mac → Remote (UDP 300M) | 300 Mbps, <0.1% loss | Sustainable rate |
-| Mac → Remote (UDP 500M) | 313 Mbps delivered, 37% loss | Bridge saturated above ~300 Mbps |
+| Remote → Mac (TCP) | ~864 Mbps, 0 retrans | Bridge bypassed (dst = wifi_ip, kernel handles directly) |
+| Mac → Remote (TCP) | ~856 Mbps, some retrans | Via utun, near adapter line rate |
+
+Adapter behind Prolific USB 2.0 hub (0x067b:0x2586, "Up to 480 Mb/s"):
+
+| Direction | Throughput | Notes |
+|---|---|---|
+| Remote → Mac | ~310 Mbps, 0 retrans | Bus-limited |
+| Mac → Remote (TCP) | ~300 Mbps, some retrans | Bus-limited |
+| Mac → Remote (UDP 300M) | 300 Mbps, <0.1% loss | Sustainable rate on USB 2.0 |
+| Mac → Remote (UDP 500M) | 313 Mbps delivered, 37% loss | USB 2.0 saturated above ~300 Mbps |
 
 ### Evolution
 | Version | Mac → Remote | Bottleneck |
 |---|---|---|
 | Initial (see_sent=1, no filter, 4KB buffer) | 37 Mbps, 2916 retrans | BPF buffer overflow |
 | + cBPF filter + 4MB buffer | 63 Mbps, 0 retrans | Wi-Fi uplink |
-| + utun fast path (current) | 300 Mbps, some retrans | Bridge syscall overhead |
+| + utun fast path, via USB 2.0 hub | 300 Mbps, some retrans | USB 2.0 hub (misread as "bridge overhead" at first) |
+| + utun fast path, direct USB 3.x (current) | 856 Mbps, some retrans | Adapter line rate |
 
 ### Why utun matters — the Wi-Fi detour
 Before utun, every Mac → Remote packet was transmitted on Wi-Fi AND on Ethernet:
@@ -164,13 +174,17 @@ Without a filter, BPF copies every frame on the wire into the userspace buffer �
 ### 4 MB BPF buffer (`BIOCSBLEN` before `BIOCSETIF`)
 Default is 4 KB — overflows instantly under load. Drops happen in-kernel and are invisible to us. Request 4 MB up front, halve and retry if the kernel rejects. macOS Sequoia accepted 4 MB without complaint.
 
-### Remaining ceiling (~300 Mbps)
-The bridge is now syscall-bound. Each Mac → Remote packet costs:
+### Remaining ceiling
+With the adapter on USB 3.x, throughput sits around **856 Mbps** — essentially the gigabit adapter's line rate, not a software ceiling. We haven't found the real software ceiling; the bridge has never been the bottleneck on this hardware.
+
+Per-packet syscall cost (kept here for future profiling work, if we ever exceed gigabit):
 - 1 `read()` from utun (kernel → user copy)
 - 1 `write()` to en10 BPF (user → kernel copy)
 - Plus `poll()` overhead
 
-At MTU-sized packets, that's ~25k pps × 2 syscalls = ~50k syscalls/sec. Each is 1-3μs → ~50-150ms of wall time per second spent in syscall overhead. The remaining time is the kernel driver path.
+At MTU-sized packets, ~25k pps × 2 syscalls ≈ 50k syscalls/sec. This would start to matter well above 1 Gbps.
+
+**Lesson from the earlier 300 Mbps plateau**: we initially blamed "bridge syscall overhead" for the ceiling, but it was the Prolific USB 2.0 hub in the path. Always check `system_profiler SPUSBDataType` before attributing throughput issues to software.
 
 ### What's NOT available on macOS for further gains
 - **Zero-copy BPF** (`BIOCSETBUFMODE` + `BPF_BUFMODE_ZBUF`): FreeBSD has it, Darwin doesn't.

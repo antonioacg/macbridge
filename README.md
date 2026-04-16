@@ -56,7 +56,9 @@ Three data paths:
 
 ## Performance
 
-~300 Mbps bidirectional on the test hardware (MacBook + USB Gigabit + OrangePi 5 Pro). Key optimizations:
+~850 Mbps bidirectional on the test hardware (MacBook + USB 3.x Gigabit Ethernet + OrangePi 5 Pro) — near line-rate for the adapter. When the Ethernet adapter is placed behind a USB 2.0 hub, the bus caps throughput at ~300 Mbps regardless of software tuning. Check the USB topology with `system_profiler SPUSBDataType` if numbers look low.
+
+Key optimizations:
 
 - **utun fast path** for Mac → Remote — bypasses the Wi-Fi driver entirely (otherwise every packet gets transmitted over the air too and wastes airtime).
 - **Kernel-side cBPF filters** — kernel drops irrelevant frames before they hit the userspace buffer.
